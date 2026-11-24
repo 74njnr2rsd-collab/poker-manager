@@ -1,9 +1,11 @@
+
 import asyncio
 import logging
 import os
 from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramNetworkError, TelegramServerError
 from aiogram.filters import Command
 from aiogram.types import Message
 from dotenv import load_dotenv
@@ -618,18 +620,40 @@ async def ai_chat(message: Message):
 
 async def main():
     await init_db()
-    me = await bot.get_me()
 
     global BOT_USERNAME
-    if not BOT_USERNAME:
-        BOT_USERNAME = (me.username or "").lower()
 
-    log.info("Bot started as @%s", me.username)
-    log.info("AI endpoint: %s", OPENAI_BASE_URL)
-    log.info("AI model: %s", OPENAI_MODEL)
-    log.info("Yandex folder configured: %s", bool(YANDEX_FOLDER_ID))
+    attempt = 0
+    while True:
+        try:
+            me = await bot.get_me()
 
-    await dp.start_polling(bot)
+            if not BOT_USERNAME:
+                BOT_USERNAME = (me.username or "").lower()
+
+            log.info("Bot started as @%s", me.username)
+            log.info("AI endpoint: %s", OPENAI_BASE_URL)
+            log.info("AI model: %s", OPENAI_MODEL)
+            log.info("Yandex folder configured: %s", bool(YANDEX_FOLDER_ID))
+            break
+
+        except (
+            TelegramServerError,
+            TelegramNetworkError,
+            asyncio.TimeoutError
+        ):
+            attempt += 1
+            delay = min(2 ** attempt, 30)
+            log.exception(
+                "Telegram connection failed. Retry #%s in %s seconds",
+                attempt, delay
+            )
+            await asyncio.sleep(delay)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":

@@ -1,22 +1,21 @@
 import asyncio
 import logging
 import os
-import re
 from collections import defaultdict
-from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 from db import (
     init_db, add_player, find_player, list_players, create_session,
     get_active_session, close_session, add_operation, cancel_operation,
-    update_operation, get_history, get_player_stats, get_total_stats,
-    get_session_player_stats, get_session_players,
-    save_chat_message, get_recent_chat_messages, get_chat_memories,
-    get_unsummarized_chat_messages, mark_chat_messages_summarized
+    update_operation, get_history, get_total_stats,
+    get_session_player_stats, save_chat_message, get_recent_chat_messages,
+    get_chat_memories, get_unsummarized_chat_messages,
+    mark_chat_messages_summarized
 )
 from calculations import calculate_settlement, money
 
@@ -27,17 +26,27 @@ log = logging.getLogger("poker-bot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_BASE_URL = os.getenv(
+    "OPENAI_BASE_URL", "https://api.openai.com/v1"
+).strip().rstrip("/")
+YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
+    raise RuntimeError("Не задан BOT_TOKEN")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
 ai_client = None
 if OPENAI_API_KEY:
-    from openai import AsyncOpenAI
-    ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    client_options = {
+        "api_key": OPENAI_API_KEY,
+        "base_url": OPENAI_BASE_URL,
+    }
+    if YANDEX_FOLDER_ID:
+        client_options["project"] = YANDEX_FOLDER_ID
+    ai_client = AsyncOpenAI(**client_options)
 
 RECENT_CONTEXT_MESSAGES = int(os.getenv("RECENT_CONTEXT_MESSAGES", "40"))
 MEMORY_BATCH_SIZE = int(os.getenv("MEMORY_BATCH_SIZE", "25"))
@@ -46,10 +55,11 @@ last_ai_reply = defaultdict(float)
 
 SYSTEM_PROMPT = """
 Ты участник дружеской русскоязычной компании, которая играет в покер.
-Общайся естественно, коротко, с юмором, подколами и умеренным матом.
-Не будь навязчивым: отвечай по делу, не изображай реального человека и не выдумывай
-факты о прошлых играх. Если передан контекст статистики — используй только его.
-Не придумывай суммы, результаты, карты или действия игроков.
+Общайся естественно, коротко, с юмором, подколами и матом, когда уместно.
+Будь своим в компании, не говори канцеляритом.
+Не будь навязчивым: отвечай по делу.
+Не выдумывай факты о прошлых играх, суммы, результаты, карты или действия игроков.
+Используй переданную статистику и долговременную память.
 Не подталкивай людей отыгрываться, занимать деньги или повышать ставки.
 Если сообщение не требует ответа, верни ровно [SKIP].
 """
@@ -65,12 +75,13 @@ def mention_or_reply(message: Message) -> bool:
 
 def likely_poker_chat(text: str) -> bool:
     words = (
-        "покер", "раздач", "флоп", "терн", "ривер", "префлоп", "олл-ин",
-        "оллин", "банк", "ставк", "бай-ин", "байин", "кто выиграл",
-        "кто проиграл", "долг", "должен", "сесси", "карты", "блеф"
+        "покер", "раздач", "флоп", "терн", "ривер", "префлоп",
+        "олл-ин", "оллин", "банк", "ставк", "бай-ин", "байин",
+        "кто выиграл", "кто проиграл", "долг", "должен",
+        "сесси", "карты", "блеф"
     )
-    t = text.lower()
-    return any(w in t for w in words)
+    text = text.lower()
+    return any(word in text for word in words)
 
 
 async def stats_context(chat_id: int) -> str:
@@ -78,7 +89,9 @@ async def stats_context(chat_id: int) -> str:
     if not totals:
         return "Пока нет сохранённой статистики."
 
-    lines = ["Общая статистика игроков (плюс — выигрыш, минус — проигрыш):"]
+    lines = [
+        "Общая статистика игроков (плюс — выигрыш, минус — проигрыш):"
+    ]
     for row in totals:
         lines.append(f"- {row['name']}: {money(row['net'])} ₽")
 
@@ -91,25 +104,28 @@ async def stats_context(chat_id: int) -> str:
                 f"- {row['name']}: бай-ины {money(row['buys'])} ₽, "
                 f"выходы {money(row['cashouts'])} ₽"
             )
+
     return "\n".join(lines)
 
 
 async def refresh_long_term_memory(chat_id: int):
-    """Сжимает накопившиеся сообщения в долговременные заметки SQLite."""
     if not ai_client:
         return
 
-    pending = await get_unsummarized_chat_messages(chat_id, MEMORY_BATCH_SIZE)
+    pending = await get_unsummarized_chat_messages(
+        chat_id, MEMORY_BATCH_SIZE
+    )
     if len(pending) < MEMORY_BATCH_SIZE:
         return
 
     previous = await get_chat_memories(chat_id, 12)
     previous_text = "\n".join(
-        f"- {m['content']}" for m in previous
+        f"- {item['content']}" for item in previous
     ) or "Пока нет."
 
     batch_text = "\n".join(
-        f"{m['username']}: {m['content']}" for m in pending
+        f"{item['username']}: {item['content']}"
+        for item in pending
     )
 
     response = await ai_client.chat.completions.create(
@@ -119,12 +135,10 @@ async def refresh_long_term_memory(chat_id: int):
                 "role": "system",
                 "content": (
                     "Ты ведёшь долговременную память группового покерного чата. "
-                    "Извлекай только устойчивые и полезные факты: кто участники, "
-                    "их предпочтения и манера общения, важные договорённости, "
-                    "повторяющиеся шутки, конфликты и события покерных вечеров. "
-                    "Не делай выводов о характере без явных оснований, не выдумывай факты, "
-                    "не сохраняй пароли, ключи и другую секретную информацию. "
-                    "Пиши кратко по-русски, списком. Если нового важного нет, ответь NO_UPDATE."
+                    "Извлекай устойчивые полезные факты: участников, предпочтения, "
+                    "манеру общения, договорённости, повторяющиеся шутки и события. "
+                    "Не выдумывай факты и не сохраняй секретные данные. "
+                    "Пиши кратко по-русски. Если нового важного нет, ответь NO_UPDATE."
                 )
             },
             {
@@ -158,11 +172,15 @@ async def ask_ai(message: Message):
 
     chat_id = message.chat.id
     context = await stats_context(chat_id)
-    memories = await get_chat_memories(chat_id, MEMORY_CONTEXT_LIMIT)
-    recent = await get_recent_chat_messages(chat_id, RECENT_CONTEXT_MESSAGES)
+    memories = await get_chat_memories(
+        chat_id, MEMORY_CONTEXT_LIMIT
+    )
+    recent = await get_recent_chat_messages(
+        chat_id, RECENT_CONTEXT_MESSAGES
+    )
 
     memory_text = "\n".join(
-        f"- {m['content']}" for m in memories
+        f"- {item['content']}" for item in memories
     ) or "Пока нет долговременных воспоминаний."
 
     history = []
@@ -211,7 +229,9 @@ def command_args(message: Message) -> list[str]:
     return (message.text or "").split()[1:]
 
 
-async def get_or_add_player(chat_id: int, user_id: int, name: str) -> dict:
+async def get_or_add_player(
+    chat_id: int, user_id: int, name: str
+) -> dict:
     player = await find_player(chat_id, user_id)
     if player:
         return player
@@ -219,7 +239,6 @@ async def get_or_add_player(chat_id: int, user_id: int, name: str) -> dict:
 
 
 async def get_operation_player(message: Message):
-    """Определяет игрока для /buy и /exit. За другого игрока может записывать админ."""
     if not message.from_user:
         return None, "Не удалось определить отправителя."
 
@@ -232,15 +251,11 @@ async def get_operation_player(message: Message):
         if target.id != message.from_user.id:
             try:
                 member = await bot.get_chat_member(
-                    message.chat.id,
-                    message.from_user.id
+                    message.chat.id, message.from_user.id
                 )
             except Exception:
                 log.exception("Не удалось проверить права пользователя")
-                return None, (
-                    "Не удалось проверить права. Попробуй ещё раз "
-                    "или попроси администратора."
-                )
+                return None, "Не удалось проверить права. Попробуй ещё раз."
 
             if member.status not in ("administrator", "creator"):
                 return None, (
@@ -248,9 +263,7 @@ async def get_operation_player(message: Message):
                 )
 
     player = await get_or_add_player(
-        message.chat.id,
-        target.id,
-        target.full_name
+        message.chat.id, target.id, target.full_name
     )
     return player, None
 
@@ -280,7 +293,6 @@ async def cmd_start(message: Message):
 async def cmd_join(message: Message):
     if not message.from_user:
         return
-
     player = await get_or_add_player(
         message.chat.id,
         message.from_user.id,
@@ -297,7 +309,6 @@ async def cmd_players(message: Message):
     if not players:
         await message.answer("Пока никого нет. Напиши /join.")
         return
-
     await message.answer(
         "Игроки:\n" + "\n".join(f"• {p['name']}" for p in players)
     )
@@ -356,13 +367,9 @@ async def cmd_buy(message: Message):
         return
 
     op = await add_operation(
-        session["id"],
-        player["id"],
-        "buy",
-        amount,
-        message.from_user.id
+        session["id"], player["id"], "buy",
+        amount, message.from_user.id
     )
-
     await message.answer(
         f"Записал бай-ин {money(amount)} ₽ для {player['name']} "
         f"(операция #{op['id']})."
@@ -400,13 +407,9 @@ async def cmd_exit(message: Message):
         return
 
     op = await add_operation(
-        session["id"],
-        player["id"],
-        "cashout",
-        amount,
-        message.from_user.id
+        session["id"], player["id"], "cashout",
+        amount, message.from_user.id
     )
-
     await message.answer(
         f"Записал выход {money(amount)} ₽ для {player['name']} "
         f"(операция #{op['id']})."
@@ -426,13 +429,12 @@ async def cmd_stats(message: Message):
         return
 
     lines = ["Статистика текущей игры:"]
-    for r in rows:
-        net = int(r["cashouts"]) - int(r["buys"])
+    for row in rows:
+        net = int(row["cashouts"]) - int(row["buys"])
         lines.append(
-            f"• {r['name']}: бай-ины {money(r['buys'])} ₽, "
-            f"выход {money(r['cashouts'])} ₽, итог {money(net)} ₽"
+            f"• {row['name']}: бай-ины {money(row['buys'])} ₽, "
+            f"выход {money(row['cashouts'])} ₽, итог {money(net)} ₽"
         )
-
     await message.answer("\n".join(lines))
 
 
@@ -444,8 +446,8 @@ async def cmd_end_poker(message: Message):
         return
 
     rows = await get_session_player_stats(session["id"])
-    total_buys = sum(int(r["buys"]) for r in rows)
-    total_cashouts = sum(int(r["cashouts"]) for r in rows)
+    total_buys = sum(int(row["buys"]) for row in rows)
+    total_cashouts = sum(int(row["cashouts"]) for row in rows)
 
     if total_buys != total_cashouts:
         await message.answer(
@@ -466,11 +468,11 @@ async def cmd_end_poker(message: Message):
         return
 
     lines = ["Игра закрыта. Переводы:"]
-    for t in transfers:
+    for transfer in transfers:
         lines.append(
-            f"• {t['from']} → {t['to']}: {money(t['amount'])} ₽"
+            f"• {transfer['from']} → {transfer['to']}: "
+            f"{money(transfer['amount'])} ₽"
         )
-
     await message.answer("\n".join(lines))
 
 
@@ -491,13 +493,16 @@ async def cmd_cancel(message: Message):
 @dp.message(Command("edit"))
 async def cmd_edit(message: Message):
     args = command_args(message)
-    if len(args) < 2 or not args[0].isdigit() or not args[1].isdigit():
+    if (
+        len(args) < 2
+        or not args[0].isdigit()
+        or not args[1].isdigit()
+    ):
         await message.answer("Формат: /edit ID НОВАЯ_СУММА")
         return
 
-    amount = int(args[1])
     ok = await update_operation(
-        int(args[0]), message.chat.id, amount
+        int(args[0]), message.chat.id, int(args[1])
     )
     await message.answer(
         "Сумму обновил."
@@ -513,13 +518,12 @@ async def cmd_history(message: Message):
         return
 
     lines = ["Последние операции:"]
-    for r in rows:
+    for row in rows:
+        kind = "бай-ин" if row["kind"] == "buy" else "выход"
         lines.append(
-            f"#{r['id']} {r['name']} — "
-            f"{'бай-ин' if r['kind']=='buy' else 'выход'} "
-            f"{money(r['amount'])} ₽ ({r['created_at']})"
+            f"#{row['id']} {row['name']} — {kind} "
+            f"{money(row['amount'])} ₽ ({row['created_at']})"
         )
-
     await message.answer("\n".join(lines))
 
 
@@ -533,7 +537,7 @@ async def cmd_player(message: Message):
     query = " ".join(args).lower()
     rows = await get_total_stats(message.chat.id)
     found = next(
-        (r for r in rows if r["name"].lower() == query),
+        (row for row in rows if row["name"].lower() == query),
         None
     )
 
@@ -556,21 +560,19 @@ async def cmd_total(message: Message):
         return
 
     rows = sorted(
-        rows,
-        key=lambda r: int(r["net"]),
-        reverse=True
+        rows, key=lambda row: int(row["net"]), reverse=True
     )
-
+    command = (message.text or "").split()[0]
     title = (
         "Общий рейтинг:"
-        if (message.text or "").split()[0].endswith("leaderboard")
+        if command.endswith("leaderboard")
         else "Общий баланс:"
     )
 
     await message.answer(
         title + "\n" + "\n".join(
-            f"{i+1}. {r['name']}: {money(r['net'])} ₽"
-            for i, r in enumerate(rows)
+            f"{i+1}. {row['name']}: {money(row['net'])} ₽"
+            for i, row in enumerate(rows)
         )
     )
 
@@ -579,7 +581,6 @@ async def cmd_total(message: Message):
 async def ai_chat(message: Message):
     if not ai_client or not message.from_user or message.from_user.is_bot:
         return
-
     if message.chat.type not in ("group", "supergroup"):
         return
 
@@ -624,6 +625,10 @@ async def main():
         BOT_USERNAME = (me.username or "").lower()
 
     log.info("Bot started as @%s", me.username)
+    log.info("AI endpoint: %s", OPENAI_BASE_URL)
+    log.info("AI model: %s", OPENAI_MODEL)
+    log.info("Yandex folder configured: %s", bool(YANDEX_FOLDER_ID))
+
     await dp.start_polling(bot)
 
 
